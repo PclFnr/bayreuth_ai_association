@@ -5,7 +5,7 @@ import withSearch from './src/markdoc/search.mjs'
 const nextConfig = {
   pageExtensions: ['js', 'jsx', 'md', 'ts', 'tsx'],
   output: "export",
-  basePath: '/bayreuth_ai_association ' // Comment out for local testing
+  basePath: '/bayreuth_ai_association' // Comment out for local testing
 }
 
 export default withSearch(
