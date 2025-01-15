@@ -11,6 +11,7 @@ from pathlib import Path
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
 import keras
+import keras_tuner as kt
 
 # Constants
 PATH_TO_DATA = Path(__file__).parent.joinpath("data/extended_data.csv")
@@ -33,12 +34,14 @@ targets = ["Target Coffee" ,"Target Milk Coffee", "Target Cocoa", "Target Tee" ,
 df_data = pd.read_csv(PATH_TO_DATA, index_col=0)
 df_data.drop(columns=["Student Tax", "Worker Tax", "Guest Tax"], inplace=True)
 
-def create_model(n_features: int, out_shape: int) -> keras.Sequential:
+def create_model(hp, n_features: int, out_shape: int) -> keras.Sequential:
     """
-    Creates and compiles a Keras sequential model for time series prediction.
+    Creates and compiles a Keras sequential model with tunable hyperparameters.
 
     Parameters:
     -----------
+        hp: HyperParameters
+            Hyperparameter object for tuning.
         n_features: int
             The number of input features for the model.
         out_shape: int
@@ -51,17 +54,14 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     model = keras.Sequential()
 
     # Input layer
-    model.add(
-        keras.layers.InputLayer(shape=(None, n_features))
-    )
+    model.add(keras.layers.InputLayer(shape=(None, n_features)))
 
     # Dense encoder layer
     model.add(
         keras.layers.Dense(
-            units=128,
-            activation="tanh",
-            kernel_regularizer=keras.regularizers.L2(l2=0.01),
-            bias_regularizer=keras.regularizers.L2(l2=0.1),
+            units=hp.Int("dense_units", min_value=64, max_value=256, step=32),
+            activation=hp.Choice("dense_activation", ["tanh", "relu"]),
+            kernel_regularizer=keras.regularizers.L2(l2=hp.Float("dense_l2", 1e-4, 1e-2, sampling="log")),
             use_bias=True,
         )
     )
@@ -69,10 +69,10 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     # LSTM layer for sequence learning
     model.add(
         keras.layers.LSTM(
-            units=256,  # Number of memory neurons
-            return_sequences=True,  # Sequences for continuous prediction
-            kernel_regularizer=keras.regularizers.L2(l2=0.01),
-            recurrent_regularizer=keras.regularizers.L2(l2=0.01),
+            units=hp.Int("lstm_units", min_value=128, max_value=512, step=64),
+            return_sequences=True,
+            kernel_regularizer=keras.regularizers.L2(l2=hp.Float("lstm_l2", 1e-4, 1e-2, sampling="log")),
+            recurrent_regularizer=keras.regularizers.L2(l2=hp.Float("lstm_rec_l2", 1e-4, 1e-2, sampling="log")),
             use_bias=False,
         )
     )
@@ -82,25 +82,65 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
         keras.layers.Dense(
             units=out_shape,
             activation="linear",
-            kernel_regularizer=keras.regularizers.L2(l2=0.01),
+            kernel_regularizer=keras.regularizers.L2(l2=hp.Float("dense_out_l2", 1e-4, 1e-2, sampling="log")),
             use_bias=False,
         )
     )
 
     # Leaky ReLU activation
-    model.add(keras.layers.LeakyReLU(negative_slope=0.02))
+    model.add(keras.layers.LeakyReLU(negative_slope=hp.Float("leaky_relu_slope", 0.01, 0.2, step=0.01)))
 
-    # Cut the output so that we need only a limited portion of the resulting sequence
+    # Output slicing
     model.add(keras.layers.Lambda(lambda x: x[:, -N_FUTURES:, :]))
 
     # Compile the model
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        optimizer=keras.optimizers.Adam(learning_rate=hp.Choice("learning_rate", [1e-3, 1e-4, 1e-5])),
         loss=LOSS,
-        metrics=["mae"]
+        metrics=["mae"],
     )
 
     return model
+
+
+def tune_model(n_features: int, out_shape: int, max_trials: int = 1, executions_per_trial: int = 1):
+    """
+    Tunes hyperparameters using Keras Tuner.
+    
+    Parameters:
+    -----------
+        n_features: int
+            Number of input features.
+        out_shape: int
+            Shape of the output layer.
+        max_trials: int
+            Maximum number of trials for tuning.
+        executions_per_trial: int
+            Number of executions per trial for reliability.
+    
+    Returns:
+    --------
+        tuner: Hyperband
+            The tuner object with results.
+    """
+    tuner = kt.RandomSearch(
+        lambda hp: create_model(hp, n_features, out_shape),
+        objective="val_mae",
+        max_trials=1,
+        directory="hyperparameter_tuning",
+        project_name="time_series_model",
+    )
+
+    # Search for the best hyperparameters
+    tuner.search(
+        x=X_train,
+        y=y_train,
+        validation_data=(X_test, y_test),
+        epochs=1,
+        callbacks=[keras.callbacks.EarlyStopping(monitor="val_loss", patience=5)],
+    )
+
+    return tuner
 
 
 def string_to_datetime(date_string: str) -> datetime:
@@ -386,10 +426,27 @@ if True:
     X_test, y_test = get_data_from_dates(dates=test_data, df=df_data)
 
     # create model
-    model = create_model(n_features=df_data.shape[1], out_shape=len(targets))
+    N_FEATURES=df_data.shape[1]
+    OUT_SHAPE=len(targets)
+    #model = create_model(n_features=df_data.shape[1], out_shape=len(targets))
+    # Execute the tuning process
+    tuner = tune_model(N_FEATURES, OUT_SHAPE)
+
+    # Retrieve the best hyperparameters and build the best model
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    model = tuner.hypermodel.build(best_hps)
     model.summary()
+    
     # fit model
-    history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_test, y_test), verbose=1)
+    history = model.fit(X_train, 
+                        y_train, 
+                        batch_size=BATCH_SIZE, 
+                        epochs=N_EPOCHS, 
+                        validation_data=(X_test, y_test), 
+                        verbose=1, 
+                        callbacks=[keras.callbacks.EarlyStopping(monitor="val_loss", 
+                                                                 patience=5, 
+                                                                 restore_best_weights=True)])
 
     # plot learning
     plot_history(history=history)
