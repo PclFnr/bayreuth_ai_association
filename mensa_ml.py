@@ -13,24 +13,25 @@ from sklearn.metrics import mean_absolute_error
 import keras
 
 # Constants
-PATH_TO_DATA = Path(__file__).parent.joinpath("extended_data.csv")
+PATH_TO_DATA = Path(__file__).parent.joinpath("data/extended_data.csv")
 
 LOSS = keras.losses.LogCosh()  # Loss function for the model
 
-N_DAYS = 14  # Time frame of days
-N_FUTURES = 14 #  Days to predict for future
+N_DAYS = 21  # Time frame of days
+N_FUTURES = 30 #  Days to predict for future
 
-N_YEARS = 2  # Number of years to consider
+N_YEARS = 3  # Number of years to consider
 N_PADDING = 2 * (N_YEARS - 1) * N_DAYS + N_YEARS * (N_FUTURES + 1) + N_DAYS  # Padding size
 
-BATCH_SIZE = 30  # Batch size for training
-N_EPOCHS = 30  # Number of training epochs
+BATCH_SIZE = 15  # Batch size for training
+N_EPOCHS = 20  # Number of training epochs
 
 metrics = ["loss", "mae"]
+targets = ["Target Coffee" ,"Target Milk Coffee", "Target Cocoa", "Target Tee" ,"Target Coffee Time"]
 
 # Load dataset
 df_data = pd.read_csv(PATH_TO_DATA, index_col=0)
-
+df_data.drop(columns=["Student Tax", "Worker Tax", "Guest Tax"], inplace=True)
 
 def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     """
@@ -57,7 +58,7 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     # Dense encoder layer
     model.add(
         keras.layers.Dense(
-            units=64,
+            units=128,
             activation="tanh",
             kernel_regularizer=keras.regularizers.L2(l2=0.01),
             bias_regularizer=keras.regularizers.L2(l2=0.1),
@@ -68,7 +69,7 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     # LSTM layer for sequence learning
     model.add(
         keras.layers.LSTM(
-            units=192,  # Number of memory neurons
+            units=256,  # Number of memory neurons
             return_sequences=True,  # Sequences for continuous prediction
             kernel_regularizer=keras.regularizers.L2(l2=0.01),
             recurrent_regularizer=keras.regularizers.L2(l2=0.01),
@@ -87,7 +88,7 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     )
 
     # Leaky ReLU activation
-    model.add(keras.layers.LeakyReLU(negative_slope=0.2))
+    model.add(keras.layers.LeakyReLU(negative_slope=0.02))
 
     # Cut the output so that we need only a limited portion of the resulting sequence
     model.add(keras.layers.Lambda(lambda x: x[:, -N_FUTURES:, :]))
@@ -158,14 +159,18 @@ def get_data_advance(date_string: str, n_days: int, n_future: int) -> list[str]:
     past_this_year = [(target_date - timedelta(days=i)).date() for i in range(1, n_future + n_days + 1)][::-1]
 
     # Dates one year ago
-    year_ago = target_date - relativedelta(years=1)
-    # days before target a year ago
-    past_before = [(year_ago - timedelta(days=i)).date() for i in range(1, n_future + n_days + 1)][::-1]
-    # days after required period a year ago
-    past_after = [(year_ago + timedelta(days=i)).date() for i in range(0, n_days + 1)]
+    frame = list()
+    for i in range(1, N_YEARS):
+        year_ago = target_date - relativedelta(years=i)
+        # days before target a year ago
+        past_before = [(year_ago - timedelta(days=i)).date() for i in range(1, n_future + n_days + 1)][::-1]
+        # days after required period a year ago
+        past_after = [(year_ago + timedelta(days=i)).date() for i in range(0, n_days + 1)]
+        # add it
+        frame += (past_before + past_after + past_this_year)
 
     # Combine and sort dates
-    frame = sorted(past_before + past_after + past_this_year)
+    frame = sorted(frame)
 
     return [datetime_to_string(date) for date in frame]
 
@@ -236,10 +241,10 @@ def get_fold_for_date(date_str: str, df: pd.DataFrame) -> tuple[np.ndarray, np.n
     """
     # Extract target data for future
     interesting_dates = get_data_future(date_str, n_future=N_FUTURES)
-    y_data = df.loc[interesting_dates, "Target"].to_numpy().reshape(-1, 1)
+    y_data = df.loc[interesting_dates, targets].to_numpy()
     # copy interesting part from the dataframe and make them zeros because we do not know them
     rows = df.loc[interesting_dates].copy()
-    rows["Target"] = 0.0
+    rows[targets] = 0.0
     y_features = rows.to_numpy()
 
     # Extract frame features from the past
@@ -328,11 +333,15 @@ def plot_history(history):
     plt.show()
 
 # cut off the earliest date possbile for training
-EARLIEST_DATE_POSSIBLE = "2022-11-01"
+EARLIEST_DATE_POSSIBLE = "2017-10-01"
 
 # split to train, test, validation
-BORDER_DATE = "2024-01-01"
+BORDER_DATE = "2023-01-01"
 test_data = df_data.index[df_data.index >= BORDER_DATE].to_list() # dates that will not be shown to models
+
+# select test_samples that have no zero results
+zero_mask = (df_data.loc[test_data, targets] == 0).all(axis=1)
+non_zero_dates = [date for mask, date in zip(zero_mask, test_data, strict=True) if not mask]
 
 # other stuff must be splitted
 rest_data = list(set(df_data.index).difference(set(test_data))) # all other dates for training
@@ -360,7 +369,7 @@ if False:
         X_val, y_val = get_data_from_dates(dates=dates_val, df=df_data)
 
         # create a model
-        model = create_model(n_features=df_data.shape[1], out_shape=1)
+        model = create_model(n_features=df_data.shape[1], out_shape=len(targets))
 
         # fit model
         history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_val, y_val), verbose=0)
@@ -377,10 +386,10 @@ if True:
     X_test, y_test = get_data_from_dates(dates=test_data, df=df_data)
 
     # create model
-    model = create_model(n_features=df_data.shape[1], out_shape=1)
+    model = create_model(n_features=df_data.shape[1], out_shape=len(targets))
     model.summary()
     # fit model
-    history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_test, y_test), verbose=0)
+    history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_test, y_test), verbose=1)
 
     # plot learning
     plot_history(history=history)
@@ -422,10 +431,9 @@ def iterative_learning(
 
     # create new model and fit it
     # model = create_model(n_features=updated_df.shape[1], out_shape=1)
-    model.fit(X_data, y_data, batch_size=BATCH_SIZE, epochs=N_EPOCHS, verbose=0)
+    model.fit(X_data, y_data, batch_size=BATCH_SIZE, epochs=N_EPOCHS, verbose=1)
 
     return updated_df, model
-
 
 
 def continuous_prediction(
@@ -457,7 +465,7 @@ def continuous_prediction(
     df_copy = df.copy()
 
     # List to store prediction results
-    results = np.array(list())
+    results = np.zeros(shape=(0, len(targets)))
 
     # make step-by-step predictions
     while len(new_data) > 0:
@@ -485,12 +493,12 @@ def continuous_prediction(
         # Generate input features for the model based on the updated DataFrame
         X_data, _ = get_data_from_dates(dates=[next_end], df=df_copy)
         # Make predictions using the model
-        y_data = model.predict(X_data, verbose=0).reshape(-1)[-n_days:]
+        y_data = model.predict(X_data, verbose=0)[0, -n_days:, :]
         # Update the DataFrame with the predicted target value
-        df_copy.loc[indexes, "Target"] = y_data
+        df_copy.loc[indexes, targets] = y_data
 
         # Store the result for the return value
-        results = np.hstack([results, y_data])
+        results = np.vstack([results, y_data])
 
         # Switch to the next date
         next_start = next_date_str
@@ -530,7 +538,7 @@ def smart_continuous_prediction(
     grouped_dates = df_dates.groupby('Group')
 
     # Initialize an empty results array
-    results = np.array(list())
+    results = np.zeros(shape=(0, len(targets)))
 
     # Perform predictions and incremental learning by group
     for _, group_df in grouped_dates:
@@ -539,54 +547,102 @@ def smart_continuous_prediction(
 
         # Predict for the current group
         predictions = continuous_prediction(df=df, new_data=temporal_data.copy(), model=model)
-        results = np.hstack([results, predictions])
+        results = np.vstack([results, predictions])
 
         # Perform incremental learning with the current group
         df, model = iterative_learning(old_data=df, new_data=temporal_data, model=model)
 
     return results
 
-
 # Perform simple prediction using the model
 y_predict_simple = model.predict(X_test, verbose=0)
-# Reshape results into 2D
-y_test = y_test.reshape(y_test.shape[0], -1)
-y_predict_simple = y_predict_simple.reshape(y_predict_simple.shape[0], -1)
-# Calculate MAE 
-mae = mean_absolute_error(y_true=y_test, y_pred=y_predict_simple)
-print("Simple Prediction MAE: ", round(mae, 3))
 
 # Prepare new data for continuous prediction
 new_data = df_data.loc[test_data].copy()
 
 # Remove test data from the original DataFrame to avoid overlap
+truth_df = df_data.loc[test_data, targets].copy()
 df_data.drop(index=test_data, inplace=True)
 
-# Plot the prediction results
-plt.figure(figsize=(6, 10))
+# Try just a simple continuous prediciton witho
+y_simple_continuous_predict = continuous_prediction(df=df_data, new_data=new_data.copy(), model=model)
 
-# Plot real sales data
-plt.plot(test_data, y_test[:, -1], color="orange", label="Real Sales")
-
-# Plot simple predictions
-plt.plot(test_data, y_predict_simple[:, -1], color="blue", label="Simple Predicted Sales")
-
-# Continuous predictions
+# Smart Continuous prediction with relearning
 if True:
     print("Continuous Prediction")
     y_predict_continuous = smart_continuous_prediction(df=df_data, new_data=new_data, model=model, time_unit="M")
-    plt.plot(test_data, y_predict_continuous, color="green", label="Continuous Predicted Sales")
 
-    # calculate MAE
-    mae = mean_absolute_error(y_true=y_test[:, -1], y_pred=y_predict_continuous)
-    print("Adaptive Learning MAE: ", round(mae, 3))
+# create data for plotting from all predictions
+simple_predicted_df = pd.DataFrame(y_predict_simple[:, -1, :].squeeze(), columns=targets, index=test_data)
+smart_predicted_df = pd.DataFrame(y_predict_continuous, columns=targets, index=test_data)
+continuous_predicted_df = pd.DataFrame(y_simple_continuous_predict, columns=targets, index=test_data)
 
-# Configure the plot
-plt.title("Long-Time Prediction")
-plt.xlabel("Days")
-plt.ylabel("Sales")
-plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=7))
-plt.xticks(rotation=45)
-plt.tight_layout()
-plt.legend()
-plt.show()
+# Calculate MAE 
+mae = mean_absolute_error(y_true=truth_df.values, y_pred=simple_predicted_df.values)
+print("Simple Prediction MAE: ", round(mae, 3))
+# Calculate MAE for simple continuous prediction
+mae = mean_absolute_error(y_true=truth_df.values, y_pred=continuous_predicted_df.values)
+print("Continuous Prediction MAE: ", round(mae, 3))
+# Calculate MAE for adaptive continuous prediction
+mae = mean_absolute_error(y_true=truth_df.values, y_pred=smart_predicted_df.values)
+print("Adaptive Learning MAE: ", round(mae, 3))
+
+def group_by_date(df: pd.DataFrame, time_unit: str = "M") -> pd.DataFrame:
+    """Group solution by time unit. Possible units: D - Day, M - Month, Q - Quarter, Y - Year."""
+    # Prepare dates for grouping
+    df_dates = pd.DataFrame({'Date String': list(df.index)})
+    df_dates['Date'] = pd.to_datetime(df_dates['Date String'])
+    df_dates['Group'] = df_dates['Date'].dt.to_period(time_unit)
+    df_dates[targets] = df.loc[df_dates['Date String'], targets].values.copy()
+    df_dates.sort_values(by=['Group', 'Date'], inplace=True)
+    grouped_dates = df_dates.groupby('Group')[targets].sum()
+
+    return grouped_dates
+
+
+TIME_UNIT = "W"
+INTERVAL = 1 if TIME_UNIT != "D" else 7
+
+# group all the results by unit
+truth_df = group_by_date(df=truth_df, time_unit=TIME_UNIT)
+simple_predicted_df = group_by_date(df=simple_predicted_df, time_unit=TIME_UNIT)
+smart_predicted_df = group_by_date(df=smart_predicted_df, time_unit=TIME_UNIT)
+continuous_predicted_df = group_by_date(df=continuous_predicted_df, time_unit=TIME_UNIT)
+# get axis values for plotting
+x_values = truth_df.index.map(lambda value: str(value))
+
+for target in targets:
+    # Plot the prediction results
+    plt.figure(figsize=(6, 10))
+
+    # Plot real sales data
+    plt.plot(x_values, truth_df[target], color="orange", label="Real Sales")
+
+    # Plot simple predictions
+    plt.plot(x_values, simple_predicted_df[target], color="blue", label="Simple Predicted Sales")
+
+    # Plot smart continuous prediction
+    plt.plot(x_values, smart_predicted_df[target], color="green", label="Smart Continuous Predicted Sales")
+
+    # Plot smart continuous prediction
+    plt.plot(x_values, continuous_predicted_df[target], color="red", label="Simple Continuous Predicted Sales")
+
+    # Reporting
+    print(100 * "=")
+    # Calculate MAE for continuous prediction of one target.
+    mae = mean_absolute_error(y_true=truth_df[target].values, y_pred=continuous_predicted_df[target].values)
+    print(f"Continuous MAE for {target}: ", round(mae, 3))
+    # Calculate MAE for smart continuous prediction of one target.
+    mae = mean_absolute_error(y_true=truth_df[target].values, y_pred=smart_predicted_df[target].values)
+    print(f"Adaptive Learning MAE for {target}: ", round(mae, 3))
+    print(100 * "=")
+
+    # Configure the plot
+    plt.title(f"Long-Time Prediction {target}")
+    plt.xlabel("Days")
+    plt.ylabel("Sales")
+    plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=INTERVAL))
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.legend()
+    plt.show()
