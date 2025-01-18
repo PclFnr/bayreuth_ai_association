@@ -3,13 +3,11 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
-import matplotlib.dates as mdates
 import numpy as np
 from pathlib import Path
 
 # Machine learning packages
-from sklearn.model_selection import KFold
-from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import TimeSeriesSplit 
 import keras
 
 # Constants
@@ -20,18 +18,20 @@ LOSS = keras.losses.LogCosh()  # Loss function for the model
 N_DAYS = 21  # Time frame of days
 N_FUTURES = 30 #  Days to predict for future
 
-N_YEARS = 3  # Number of years to consider
+N_YEARS = 1  # Number of years to consider
 N_PADDING = 2 * (N_YEARS - 1) * N_DAYS + N_YEARS * (N_FUTURES + 1) + N_DAYS  # Padding size
 
 BATCH_SIZE = 15  # Batch size for training
-N_EPOCHS = 20  # Number of training epochs
+N_EPOCHS = 15 # Number of training epochs
 
 metrics = ["loss", "mae"]
 targets = ["Target Coffee" ,"Target Milk Coffee", "Target Cocoa", "Target Tee" ,"Target Coffee Time"]
 
 # Load dataset
 df_data = pd.read_csv(PATH_TO_DATA, index_col=0)
-df_data.drop(columns=["Student Tax", "Worker Tax", "Guest Tax"], inplace=True)
+df_data.drop(columns=["Year", "Student Tax", "Worker Tax", "Guest Tax"], inplace=True)
+
+N_FEATURES = df_data.shape[1] + 1 # time marker for LSTM. Marker is added in the padding function.
 
 def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     """
@@ -69,7 +69,7 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     # LSTM layer for sequence learning
     model.add(
         keras.layers.LSTM(
-            units=256,  # Number of memory neurons
+            units=128,  # Number of memory neurons
             return_sequences=True,  # Sequences for continuous prediction
             kernel_regularizer=keras.regularizers.L2(l2=0.01),
             recurrent_regularizer=keras.regularizers.L2(l2=0.01),
@@ -134,7 +134,7 @@ def datetime_to_string(date: datetime) -> str:
     return datetime.strftime(date, "%Y-%m-%d")
 
 
-def get_data_advance(date_string: str, n_days: int, n_future: int) -> list[str]:
+def get_data_advance(date_string: str, n_days: int, n_years: int, n_future: int) -> list[str]:
     """
     Generate a list of date strings for the target date, including days in the past year 
     and the preceding week.
@@ -145,6 +145,8 @@ def get_data_advance(date_string: str, n_days: int, n_future: int) -> list[str]:
             The target date as a string in the format '%Y-%m-%d'.
         n_days: int
             The number of days before and after the past year's date to include.
+        n_years: int
+            The number of years to be considered in the past.
         n_future: int
             The number of days to predict for future.
 
@@ -160,7 +162,7 @@ def get_data_advance(date_string: str, n_days: int, n_future: int) -> list[str]:
 
     # Dates one year ago
     frame = list()
-    for i in range(1, N_YEARS):
+    for i in range(1, n_years):
         year_ago = target_date - relativedelta(years=i)
         # days before target a year ago
         past_before = [(year_ago - timedelta(days=i)).date() for i in range(1, n_future + n_days + 1)][::-1]
@@ -248,7 +250,7 @@ def get_fold_for_date(date_str: str, df: pd.DataFrame) -> tuple[np.ndarray, np.n
     y_features = rows.to_numpy()
 
     # Extract frame features from the past
-    frame = get_data_advance(date_string=date_str, n_days=N_DAYS, n_future=N_FUTURES)
+    frame = get_data_advance(date_string=date_str, n_days=N_DAYS, n_years=N_YEARS, n_future=N_FUTURES)
     # split frame in known and unknown parts
     frame = sorted(list(set(frame).difference(set(interesting_dates))))
     X_data = get_frame_features(frame=frame, df=df)
@@ -274,7 +276,12 @@ def padding(n_max: int, arr: np.ndarray) -> np.ndarray:
     """
     rows_to_add = n_max - arr.shape[0]
     matrix = np.zeros(shape=(rows_to_add, arr.shape[1]))
-    return np.vstack([matrix, arr])
+
+    # Add time marker for each step.
+    matrix = np.vstack([matrix, arr])
+    matrix = np.hstack([matrix, np.linspace(0, 1.0, num=matrix.shape[0], endpoint=True).reshape(-1, 1)])
+
+    return matrix
 
 
 def get_data_from_dates(dates: list[str], df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -332,35 +339,59 @@ def plot_history(history):
     plt.tight_layout()
     plt.show()
 
-# cut off the earliest date possbile for training
-EARLIEST_DATE_POSSIBLE = "2017-10-01"
 
-# split to train, test, validation
-BORDER_DATE = "2023-01-01"
-test_data = df_data.index[df_data.index >= BORDER_DATE].to_list() # dates that will not be shown to models
+def train_val_test_split(
+    dates: list[str], 
+    n_val_days: int, 
+    n_test_days: int
+) -> tuple[list[str], list[str], list[str]]:
+    """
+    Split available date in train, validation and test subsets without intersections.
 
-# select test_samples that have no zero results
-zero_mask = (df_data.loc[test_data, targets] == 0).all(axis=1)
-non_zero_dates = [date for mask, date in zip(zero_mask, test_data, strict=True) if not mask]
+    Parameters
+    ----------
+    dates: list[str]
+        All available dates in ISO format "YYYY-mm-dd".
+    n_val_days: int
+        Amount of days in the validation set.
+    n_test_days: int
+        Amount of days in the test set.
 
-# other stuff must be splitted
-rest_data = list(set(df_data.index).difference(set(test_data))) # all other dates for training
-rest_data = [date for date in rest_data if date >= EARLIEST_DATE_POSSIBLE]
+    Returns
+    -------
+    tuple[list[str], list[str], list[str]]:
+        Indices of sets in the following order:
+            - list[str]: List of training dates.
+            - list[str]: List of validation dates.
+            - list[str]: List of test dates.
+    """
+    # check for correctness
+    assert len(dates) > n_val_days + n_test_days, "Amount of dates is less than amount of validation and test sets."
+
+    # sort dates
+    sorted_dates = sorted(dates)
+
+    # get subsets
+    train_data = sorted_dates[0:-(n_val_days + n_test_days)]
+    val_data = sorted_dates[-(n_val_days + n_test_days):-n_test_days]
+    test_data = sorted_dates[-n_test_days:]
+
+    return train_data, val_data, test_data
 
 
 # K-Fold cross validation to check performance
 if False:
     k = 5  # Number of folds
-    kf = KFold(n_splits=k, shuffle=True, random_state=42)
+    tscv = TimeSeriesSplit(n_splits=k)
 
     # do K-Fold cross-validation
-    for idx, (train_index, val_index) in enumerate(kf.split(rest_data)):
+    for idx, (train_index, val_index) in enumerate(tscv.split(train_data)):
 
         print(f"Fold {idx + 1}/{k}")
 
         # get train and test dates
-        dates_train = [rest_data[i] for i in train_index]
-        dates_val = [rest_data[i] for i in val_index]
+        dates_train = [train_data[i] for i in train_index]
+        dates_val = [train_data[i] for i in val_index]
 
         # convert to features for train data
         X_train , y_train = get_data_from_dates(dates=dates_train, df=df_data)
@@ -369,30 +400,13 @@ if False:
         X_val, y_val = get_data_from_dates(dates=dates_val, df=df_data)
 
         # create a model
-        model = create_model(n_features=df_data.shape[1], out_shape=len(targets))
+        model = create_model(n_features=N_FEATURES, out_shape=len(targets))
 
         # fit model
-        history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_val, y_val), verbose=0)
+        history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_val, y_val), verbose=2)
 
         # plot learning
         plot_history(history=history)
-
-
-# real learning and testing
-if True:
-    print("Test Run")
-    # create data
-    X_train, y_train = get_data_from_dates(dates=rest_data, df=df_data)
-    X_test, y_test = get_data_from_dates(dates=test_data, df=df_data)
-
-    # create model
-    model = create_model(n_features=df_data.shape[1], out_shape=len(targets))
-    model.summary()
-    # fit model
-    history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_test, y_test), verbose=1)
-
-    # plot learning
-    plot_history(history=history)
 
 
 # for iterative learning
@@ -554,38 +568,92 @@ def smart_continuous_prediction(
 
     return results
 
-# Perform simple prediction using the model
-y_predict_simple = model.predict(X_test, verbose=0)
 
-# Prepare new data for continuous prediction
-new_data = df_data.loc[test_data].copy()
+def educated_guess(date_str: str, df: pd.DataFrame) -> np.ndarray:
+    """
+    Get an average amount of beverages for a date considering previous similar period as a base.
 
-# Remove test data from the original DataFrame to avoid overlap
-truth_df = df_data.loc[test_data, targets].copy()
-df_data.drop(index=test_data, inplace=True)
+    Parameters
+    ----------
+    date_str: str
+        Date to make a predict for.
+    df: pd.DataFrame
+        DataFrame as source of data. 
 
-# Try just a simple continuous prediciton witho
-y_simple_continuous_predict = continuous_prediction(df=df_data, new_data=new_data.copy(), model=model)
+    Returns
+    -------
+    np.ndarray
+        Prediction about beverages ["Target Coffee" ,"Target Milk Coffee", "Target Cocoa", "Target Tee" ,"Target Coffee Time"].
+    """
+    # check if it is a holiday or weekends then 0.0 for everything
+    if df.loc[date_str, "is_holiday"] or (df.loc[date_str, ["x0_Friday", "x0_Monday", "x0_Thursday", "x0_Tuesday", "x0_Wednesday"]] == 0).all():
+        return np.zeros(shape=len(targets))
 
-# Smart Continuous prediction with relearning
-if True:
-    print("Continuous Prediction")
-    y_predict_continuous = smart_continuous_prediction(df=df_data, new_data=new_data, model=model, time_unit="M")
+    # get basic data
+    is_summer, is_lecture_free = bool(df.loc[date_str, "is_summer"]), bool(df.loc[date_str, "is_leacture_free"])
+    
+    # split the date
+    year_str, month_str, _ = tuple(date_str.split("-"))
 
-# create data for plotting from all predictions
-simple_predicted_df = pd.DataFrame(y_predict_simple[:, -1, :].squeeze(), columns=targets, index=test_data)
-smart_predicted_df = pd.DataFrame(y_predict_continuous, columns=targets, index=test_data)
-continuous_predicted_df = pd.DataFrame(y_simple_continuous_predict, columns=targets, index=test_data)
+    # define start and end of a semester lectures
+    winter_lectures_end, summer_lecures_end = "02-10", "07-31"
 
-# Calculate MAE 
-mae = mean_absolute_error(y_true=truth_df.values, y_pred=simple_predicted_df.values)
-print("Simple Prediction MAE: ", round(mae, 3))
-# Calculate MAE for simple continuous prediction
-mae = mean_absolute_error(y_true=truth_df.values, y_pred=continuous_predicted_df.values)
-print("Continuous Prediction MAE: ", round(mae, 3))
-# Calculate MAE for adaptive continuous prediction
-mae = mean_absolute_error(y_true=truth_df.values, y_pred=smart_predicted_df.values)
-print("Adaptive Learning MAE: ", round(mae, 3))
+    # define borders of a semester
+    summer_start, summer_end = "04-01", "09-31"
+    winter_start, winter_end = "10-01", "03-31"
+
+    # summer and lecture free
+    if is_summer and is_lecture_free:
+        # get one year before
+        year_before = str(int(year_str) - 1)
+        # create bordering dates
+        period_start = year_before + "-" + summer_lecures_end
+        period_end = year_before + "-" + summer_end
+    
+    # summer with lectures
+    elif is_summer and not is_lecture_free:
+        # get one year before
+        year_before = str(int(year_str) - 1)
+        # create bordering dates
+        period_start = year_before + "-" + summer_start
+        period_end = year_before + "-" + summer_lecures_end
+    
+    # winter and lecture free
+    elif not is_summer and is_lecture_free:
+        # get one year before
+        year_before = str(int(year_str) - 1)
+        # create bordering dates
+        period_start = year_before + "-" + winter_lectures_end
+        period_end = year_before + "-" + winter_end
+
+    # winter with lectures
+    else:
+        # if we are in march or before, then we need to go 2 years back
+        if month_str < "04":
+            # get one and two years before
+            year_before = str(int(year_str) - 1)
+            two_years_before = str(int(year_str) - 2)
+            # create bordering dates
+            period_start = two_years_before + "-" + winter_start
+            period_end = year_before + "-" + winter_lectures_end
+
+        # if we are in october and after, then only one year
+        elif month_str > "09":
+            # get one year before
+            year_before = str(int(year_str) - 1)
+            # create bordering dates
+            period_start = year_before + "-" + winter_start
+            period_end = year_str + "-" + winter_lectures_end
+    
+    # get dates for prediction
+    time_period = [date for date in df.index if (period_start <= date <= period_end)]
+
+    # get rid of holidays and dates where all sales are zero
+    zero_mask = (df.loc[time_period, targets] == 0).all(axis=1)
+    data = df.loc[time_period, targets][~zero_mask].values
+
+    return np.mean(data, axis=0)
+
 
 def group_by_date(df: pd.DataFrame, time_unit: str = "M") -> pd.DataFrame:
     """Group solution by time unit. Possible units: D - Day, M - Month, Q - Quarter, Y - Year."""
@@ -599,50 +667,3 @@ def group_by_date(df: pd.DataFrame, time_unit: str = "M") -> pd.DataFrame:
 
     return grouped_dates
 
-
-TIME_UNIT = "W"
-INTERVAL = 1 if TIME_UNIT != "D" else 7
-
-# group all the results by unit
-truth_df = group_by_date(df=truth_df, time_unit=TIME_UNIT)
-simple_predicted_df = group_by_date(df=simple_predicted_df, time_unit=TIME_UNIT)
-smart_predicted_df = group_by_date(df=smart_predicted_df, time_unit=TIME_UNIT)
-continuous_predicted_df = group_by_date(df=continuous_predicted_df, time_unit=TIME_UNIT)
-# get axis values for plotting
-x_values = truth_df.index.map(lambda value: str(value))
-
-for target in targets:
-    # Plot the prediction results
-    plt.figure(figsize=(6, 10))
-
-    # Plot real sales data
-    plt.plot(x_values, truth_df[target], color="orange", label="Real Sales")
-
-    # Plot simple predictions
-    plt.plot(x_values, simple_predicted_df[target], color="blue", label="Simple Predicted Sales")
-
-    # Plot smart continuous prediction
-    plt.plot(x_values, smart_predicted_df[target], color="green", label="Smart Continuous Predicted Sales")
-
-    # Plot smart continuous prediction
-    plt.plot(x_values, continuous_predicted_df[target], color="red", label="Simple Continuous Predicted Sales")
-
-    # Reporting
-    print(100 * "=")
-    # Calculate MAE for continuous prediction of one target.
-    mae = mean_absolute_error(y_true=truth_df[target].values, y_pred=continuous_predicted_df[target].values)
-    print(f"Continuous MAE for {target}: ", round(mae, 3))
-    # Calculate MAE for smart continuous prediction of one target.
-    mae = mean_absolute_error(y_true=truth_df[target].values, y_pred=smart_predicted_df[target].values)
-    print(f"Adaptive Learning MAE for {target}: ", round(mae, 3))
-    print(100 * "=")
-
-    # Configure the plot
-    plt.title(f"Long-Time Prediction {target}")
-    plt.xlabel("Days")
-    plt.ylabel("Sales")
-    plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=INTERVAL))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.legend()
-    plt.show()
