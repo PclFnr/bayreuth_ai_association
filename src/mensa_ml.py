@@ -1,37 +1,33 @@
 # Basic packages
 import pandas as pd
 from matplotlib import pyplot as plt
-from datetime import datetime, timedelta
+from datetime import timedelta
 from dateutil.relativedelta import relativedelta
 import numpy as np
 from pathlib import Path
+from src.utils import string_to_datetime, datetime_to_string
 
 # Machine learning packages
 from sklearn.model_selection import TimeSeriesSplit 
 import keras
 
 # Constants
-PATH_TO_DATA = Path(__file__).parent.joinpath("data/extended_data.csv")
+PATH_TO_DATA = Path(__file__).parent.parent.joinpath("data/extended_data.csv")
 
 LOSS = keras.losses.LogCosh()  # Loss function for the model
 
 N_DAYS = 21  # Time frame of days
 N_FUTURES = 30 #  Days to predict for future
 
-N_YEARS = 1  # Number of years to consider
-N_PADDING = 2 * (N_YEARS - 1) * N_DAYS + N_YEARS * (N_FUTURES + 1) + N_DAYS  # Padding size
+N_YEARS = 2  # Number of years to consider
+N_PADDING = 2 * (N_YEARS - 1) * N_DAYS + N_YEARS * N_FUTURES + N_DAYS  # Padding size
 
 BATCH_SIZE = 15  # Batch size for training
-N_EPOCHS = 15 # Number of training epochs
+N_EPOCHS = 7 # Number of training epochs
 
 metrics = ["loss", "mae"]
-targets = ["Target Coffee" ,"Target Milk Coffee", "Target Cocoa", "Target Tee" ,"Target Coffee Time"]
+targets = ["Target Coffee", "Target Milk Coffee", "Target Cocoa", "Target Tee", "Target Coffee Time"]
 
-# Load dataset
-df_data = pd.read_csv(PATH_TO_DATA, index_col=0)
-df_data.drop(columns=["Year", "Student Tax", "Worker Tax", "Guest Tax"], inplace=True)
-
-N_FEATURES = df_data.shape[1] + 1 # time marker for LSTM. Marker is added in the padding function.
 
 def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     """
@@ -52,18 +48,12 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
 
     # Input layer
     model.add(
-        keras.layers.InputLayer(shape=(None, n_features))
+        keras.layers.InputLayer(shape=(N_PADDING, n_features))
     )
 
-    # Dense encoder layer
+    # Mask useless values
     model.add(
-        keras.layers.Dense(
-            units=128,
-            activation="tanh",
-            kernel_regularizer=keras.regularizers.L2(l2=0.01),
-            bias_regularizer=keras.regularizers.L2(l2=0.1),
-            use_bias=True,
-        )
+        keras.layers.Masking(mask_value=0.0)
     )
 
     # LSTM layer for sequence learning
@@ -103,37 +93,6 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     return model
 
 
-def string_to_datetime(date_string: str) -> datetime:
-    """
-    Converts a date string to a datetime object.
-
-    Parameters:
-    -----------
-        date_string: str
-            The date string in the format '%Y-%m-%d'.
-
-    Returns:
-    --------
-        datetime: The corresponding datetime object.
-    """
-    return datetime.strptime(date_string, "%Y-%m-%d")
-
-
-def datetime_to_string(date: datetime) -> str:
-    """
-    Converts a datetime object to a string.
-
-    Parameters:
-    -----------
-        date (datetime): The datetime object to convert.
-
-    Returns:
-    --------
-        str: The date string in the format '%Y-%m-%d'.
-    """
-    return datetime.strftime(date, "%Y-%m-%d")
-
-
 def get_data_advance(date_string: str, n_days: int, n_years: int, n_future: int) -> list[str]:
     """
     Generate a list of date strings for the target date, including days in the past year 
@@ -158,16 +117,16 @@ def get_data_advance(date_string: str, n_days: int, n_years: int, n_future: int)
     target_date = string_to_datetime(date_string=date_string)
 
     # Dates from the last week
-    past_this_year = [(target_date - timedelta(days=i)).date() for i in range(1, n_future + n_days + 1)][::-1]
+    past_this_year = [(target_date - timedelta(days=i)).date() for i in range(0, n_future + n_days)][::-1]
 
     # Dates one year ago
     frame = list()
     for i in range(1, n_years):
         year_ago = target_date - relativedelta(years=i)
         # days before target a year ago
-        past_before = [(year_ago - timedelta(days=i)).date() for i in range(1, n_future + n_days + 1)][::-1]
+        past_before = [(year_ago - timedelta(days=i)).date() for i in range(1, n_future + n_days)][::-1]
         # days after required period a year ago
-        past_after = [(year_ago + timedelta(days=i)).date() for i in range(0, n_days + 1)]
+        past_after = [(year_ago + timedelta(days=i)).date() for i in range(0, n_days)]
         # add it
         frame += (past_before + past_after + past_this_year)
 
@@ -279,7 +238,6 @@ def padding(n_max: int, arr: np.ndarray) -> np.ndarray:
 
     # Add time marker for each step.
     matrix = np.vstack([matrix, arr])
-    matrix = np.hstack([matrix, np.linspace(0, 1.0, num=matrix.shape[0], endpoint=True).reshape(-1, 1)])
 
     return matrix
 
@@ -445,7 +403,7 @@ def iterative_learning(
 
     # create new model and fit it
     # model = create_model(n_features=updated_df.shape[1], out_shape=1)
-    model.fit(X_data, y_data, batch_size=BATCH_SIZE, epochs=N_EPOCHS, verbose=1)
+    model.fit(X_data, y_data, batch_size=BATCH_SIZE, epochs=N_EPOCHS, verbose=0)
 
     return updated_df, model
 
@@ -475,7 +433,7 @@ def continuous_prediction(
     date_range = sorted(list(new_data.index))
     next_start = date_range[0]
 
-    # Create a copy of the DataFrame to avoid modifying the original
+    # Create a copy of the DataFrame to avoid modifying the original one
     df_copy = df.copy()
 
     # List to store prediction results
@@ -590,7 +548,7 @@ def educated_guess(date_str: str, df: pd.DataFrame) -> np.ndarray:
         return np.zeros(shape=len(targets))
 
     # get basic data
-    is_summer, is_lecture_free = bool(df.loc[date_str, "is_summer"]), bool(df.loc[date_str, "is_leacture_free"])
+    is_summer, is_lecture_free = bool(df.loc[date_str, "is_summer"]), bool(df.loc[date_str, "is_lecture_free"])
     
     # split the date
     year_str, month_str, _ = tuple(date_str.split("-"))
