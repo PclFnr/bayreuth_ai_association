@@ -1,17 +1,11 @@
-import matplotlib.pyplot as plt
 import pandas as pd
-import matplotlib.dates as mdates
 
 from src.utils import adjust_week
 from sklearn.preprocessing import StandardScaler
+import keras
 
 from src.mensa_ml import (
-    create_model,
-    get_data_from_dates,
-    group_by_date,
     continuous_prediction,
-    BATCH_SIZE,
-    N_EPOCHS,
     targets,
 )
 
@@ -31,22 +25,58 @@ future_data.drop(columns=["Year", "Student Tax", "Worker Tax", "Guest Tax"], inp
 future_data["Week"] = future_data["Week"].apply(adjust_week)
 future_data[["pressure", "humidity", "wind_deg"]] = scaler.transform(future_data[["pressure", "humidity", "wind_deg"]].values)
 
+# read model
+model = keras.models.load_model("mensa_model.keras", safe_mode=False)
+"""
+# split to train, test, validation
+BORDER_DATE = "2024-10-18"
+test_data = df_data.index[df_data.index >= BORDER_DATE].to_list() # dates that will not be shown to models
+
 # other stuff must be splitted
-train_data = list(df_data.index)
+train_data = list(set(df_data.index).difference(set(test_data))) # all other dates for training
+
 # cut off the earliest date possbile for training
 EARLIEST_DATE_POSSIBLE = "2017-10-01"
 train_data = sorted([date for date in train_data if date >= EARLIEST_DATE_POSSIBLE])
 
+# real learning and testing
 if True:
-    print("Learning")
+    print("Test Run")
     # create data
     X_train, y_train = get_data_from_dates(dates=train_data, df=df_data)
+    X_test, y_test = get_data_from_dates(dates=test_data, df=df_data)
 
     # create model
-    model = create_model(n_features=N_FEATURES, out_shape=len(targets))
+    N_FEATURES=df_data.shape[1]
+    OUT_SHAPE=len(targets)
+    #model = create_model(n_features=df_data.shape[1], out_shape=len(targets))
+    # Execute the tuning process
+    #tuner = tune_model(
+    #    n_features=N_FEATURES,
+    #    out_shape=OUT_SHAPE,
+    #    X_train=X_train,
+    #    y_train=y_train,
+    #    X_test=X_test,
+    #    y_test=y_test,
+    #    max_trials=15,
+    #)
+
+    # Retrieve the best hyperparameters and build the best model
+    # best_hps = tuner.get_best_hyperparameters()[0]
+    model = create_model(n_features=N_FEATURES, out_shape=OUT_SHAPE, n_futures=N_FUTURES)# tuner.hypermodel.build(best_hps)
     model.summary()
+    
     # fit model
-    history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, verbose=1)
+    history = model.fit(X_train, 
+                        y_train, 
+                        batch_size=BATCH_SIZE, 
+                        epochs=N_EPOCHS, 
+                        verbose=1,
+                        callbacks=[keras.callbacks.EarlyStopping(monitor="val_loss", 
+                                                                 patience=5, 
+                                                                 restore_best_weights=True)]
+    )
+"""
 
 # predict
 y_simple_continuous_predict = continuous_prediction(df=df_data, new_data=future_data.copy(), model=model)
@@ -54,34 +84,5 @@ y_simple_continuous_predict = continuous_prediction(df=df_data, new_data=future_
 # create data for plotting from all predictions
 continuous_predicted_df = pd.DataFrame(y_simple_continuous_predict, columns=targets, index=future_data.index)
 
-# for plotting
-TIME_UNIT = "D" # possible units: D - Day, W - week, M - month, Q - quarter.
-match TIME_UNIT:
-    case "D":
-        INTERVAL = 7
-    case "W":
-        INTERVAL = 3
-    case _:
-        INTERVAL = 1
-
-# group all the results by unit
-continuous_predicted_df = group_by_date(df=continuous_predicted_df, time_unit=TIME_UNIT)
-x_values = continuous_predicted_df.index.map(lambda value: str(value))
-# get axis values for plotting
-
-for target in targets:
-    # Plot the prediction results
-    plt.figure(figsize=(6, 10))
-
-    # Plot smart continuous prediction
-    plt.plot(x_values, continuous_predicted_df[target], color="red", label="Simple Continuous Predicted Sales")
-
-    # Configure the plot
-    plt.title(f"Long-Time Prediction {target}")
-    plt.xlabel("Days")
-    plt.ylabel("Sales")
-    plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=INTERVAL))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.legend()
-    plt.show()
+continuous_predicted_df.to_csv("predictions/2025-predict.csv")
+print("Prediction finished")

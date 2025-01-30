@@ -1,24 +1,23 @@
-import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
-import matplotlib.dates as mdates
 from sklearn.metrics import mean_absolute_error
 
 from src.utils import adjust_week
 from sklearn.preprocessing import StandardScaler
+import keras
 
 from src.mensa_ml import (
-    create_model,
     get_data_from_dates,
-    group_by_date,
-    plot_history,
     educated_guess,
     continuous_prediction,
     smart_continuous_prediction,
     BATCH_SIZE,
     N_EPOCHS,
+    N_FUTURES,
     PATH_TO_DATA,
     targets,
+    tune_model,
+    create_model,
 )
 
 # Load dataset
@@ -49,6 +48,7 @@ train_data = list(set(df_data.index).difference(set(test_data))) # all other dat
 EARLIEST_DATE_POSSIBLE = "2017-10-01"
 train_data = sorted([date for date in train_data if date >= EARLIEST_DATE_POSSIBLE])
 
+# real learning and testing
 if True:
     print("Test Run")
     # create data
@@ -56,13 +56,42 @@ if True:
     X_test, y_test = get_data_from_dates(dates=test_data, df=df_data)
 
     # create model
-    model = create_model(n_features=N_FEATURES, out_shape=len(targets))
+    N_FEATURES=df_data.shape[1]
+    OUT_SHAPE=len(targets)
+
+    # Execute the tuning process
+    """
+    tuner = tune_model(
+        n_features=N_FEATURES,
+    	out_shape=OUT_SHAPE,
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        max_trials=36,
+    )
+    """
+
+    # Retrieve the best hyperparameters and build the best model
+    # best_hps = tuner.get_best_hyperparameters()[0]
+    model = create_model(n_features=N_FEATURES, out_shape=OUT_SHAPE, n_futures=N_FUTURES) # tuner.hypermodel.build(best_hps)
     model.summary()
+    
     # fit model
-    history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_test, y_test), verbose=2)
+    history = model.fit(X_train, 
+                        y_train, 
+                        batch_size=BATCH_SIZE, 
+                        epochs=N_EPOCHS, 
+                        validation_data=(X_test, y_test), 
+                        verbose=1, 
+                        callbacks=[keras.callbacks.EarlyStopping(monitor="val_loss", 
+                                                                 patience=5, 
+                                                                 restore_best_weights=True)]
+    )
 
     # plot learning
-    plot_history(history=history)
+    # plot_history(history=history)
+    
 
 # Perform simple prediction using the model
 y_predict_simple = model.predict(X_test, verbose=0)
@@ -87,7 +116,7 @@ y_simple_continuous_predict = continuous_prediction(df=df_data, new_data=new_dat
 # Smart Continuous prediction with relearning
 if True:
     print("Continuous Prediction")
-    y_predict_continuous = smart_continuous_prediction(df=df_data, new_data=new_data, model=model, time_unit="W")
+    y_predict_continuous = smart_continuous_prediction(df=df_data, new_data=new_data, model=model, time_unit="M")
 
 # create data for plotting from all predictions
 simple_predicted_df = pd.DataFrame(y_predict_simple[:, -1, :].squeeze(), columns=targets, index=test_data)
@@ -105,60 +134,12 @@ print("Continuous Prediction MAE: ", round(mae, 3))
 mae = mean_absolute_error(y_true=truth_df.values, y_pred=smart_predicted_df.values)
 print("Adaptive Learning MAE: ", round(mae, 3))
 
-# for plotting
-TIME_UNIT = "D" # possible units: D - Day, W - week, M - month, Q - quarter.
-match TIME_UNIT:
-    case "D":
-        INTERVAL = 7
-    case "W":
-        INTERVAL = 3
-    case _:
-        INTERVAL = 1
+# save predictions to the DataFrame
+continuous_predicted_df.to_csv("predictions/2024-test-predict.csv")
+smart_predicted_df.to_csv("predictions/2024-test-predict-iterative.csv")
+truth_df.to_csv("predictions/2024-true-data.csv")
+educated_guess_df.to_csv("predictions/2024-educated-guess.csv")
 
-# group all the results by unit
-truth_df = group_by_date(df=truth_df, time_unit=TIME_UNIT)
-simple_predicted_df = group_by_date(df=simple_predicted_df, time_unit=TIME_UNIT)
-smart_predicted_df = group_by_date(df=smart_predicted_df, time_unit=TIME_UNIT)
-continuous_predicted_df = group_by_date(df=continuous_predicted_df, time_unit=TIME_UNIT)
-educated_guess_df = group_by_date(df=educated_guess_df, time_unit=TIME_UNIT)
-# get axis values for plotting
-x_values = truth_df.index.map(lambda value: str(value))
 
-for target in targets:
-    # Plot the prediction results
-    plt.figure(figsize=(6, 10))
-
-    # Plot real sales data
-    plt.plot(x_values, truth_df[target], color="orange", label="Real Sales")
-
-    # Plot smart continuous prediction
-    plt.plot(x_values, smart_predicted_df[target], color="green", label="Smart Continuous Predicted Sales")
-
-    # Plot smart continuous prediction
-    plt.plot(x_values, continuous_predicted_df[target], color="red", label="Simple Continuous Predicted Sales")
-
-    # Plot educated guess prediction
-    plt.plot(x_values, educated_guess_df[target], color="black", label="Educated Guess")
-
-    # Reporting
-    print(100 * "=")
-    # Calculate MAE for continuous prediction of one target.
-    mae = mean_absolute_error(y_true=truth_df[target].values, y_pred=continuous_predicted_df[target].values)
-    print(f"Continuous MAE for {target}: ", round(mae, 3))
-    # Calculate MAE for smart continuous prediction of one target.
-    mae = mean_absolute_error(y_true=truth_df[target].values, y_pred=smart_predicted_df[target].values)
-    print(f"Adaptive Learning MAE for {target}: ", round(mae, 3))
-    # Calculate MAE for educated guess
-    mae = mean_absolute_error(y_true=truth_df[target].values, y_pred=educated_guess_df[target].values)
-    print(f"Educated Guess MAE for {target}: ", round(mae, 3))
-    print(100 * "=")
-
-    # Configure the plot
-    plt.title(f"Long-Time Prediction {target}")
-    plt.xlabel("Days")
-    plt.ylabel("Sales")
-    plt.gca().xaxis.set_major_locator(mdates.DayLocator(interval=INTERVAL))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.legend()
-    plt.show()
+# save model
+model.save("mensa_model.keras")

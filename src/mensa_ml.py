@@ -8,8 +8,9 @@ from pathlib import Path
 from src.utils import string_to_datetime, datetime_to_string
 
 # Machine learning packages
-from sklearn.model_selection import TimeSeriesSplit 
 import keras
+import keras_tuner as kt
+from keras_tuner.src.engine.hyperparameters.hyperparameters import HyperParameters
 
 # Constants
 PATH_TO_DATA = Path(__file__).parent.parent.joinpath("data/extended_data.csv")
@@ -22,23 +23,26 @@ N_FUTURES = 30 #  Days to predict for future
 N_YEARS = 2  # Number of years to consider
 N_PADDING = 2 * (N_YEARS - 1) * N_DAYS + N_YEARS * N_FUTURES + N_DAYS  # Padding size
 
-BATCH_SIZE = 15  # Batch size for training
-N_EPOCHS = 7 # Number of training epochs
+BATCH_SIZE = 25  # Batch size for training
+N_EPOCHS = 12 # Number of training epochs
 
 metrics = ["loss", "mae"]
 targets = ["Target Coffee", "Target Milk Coffee", "Target Cocoa", "Target Tee", "Target Coffee Time"]
 
-
-def create_model(n_features: int, out_shape: int) -> keras.Sequential:
+def create_model(n_features: int, out_shape: int, n_futures: int, hp: HyperParameters = None) -> keras.Sequential:
     """
-    Creates and compiles a Keras sequential model for time series prediction.
+    Creates and compiles a Keras sequential model with tunable hyperparameters.
 
     Parameters:
     -----------
+        hp: HyperParameters
+            Hyperparameter object for tuning.
         n_features: int
             The number of input features for the model.
         out_shape: int
             The shape of the output layer.
+        n_futures: int
+            Amount of days to predict in the future.
 
     Returns:
     --------
@@ -47,22 +51,28 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
     model = keras.Sequential()
 
     # Input layer
+    model.add(keras.layers.InputLayer(shape=(None, n_features)))
+
+    # Encoder Layer
     model.add(
-        keras.layers.InputLayer(shape=(N_PADDING, n_features))
+        keras.layers.Dense(
+            units=128, #hp.Int("dense_units", min_value=64, max_value=192, step=64),
+            activation="tanh", # hp.Choice("enc_actv", values=["tanh", "relu"])
+            kernel_regularizer=keras.regularizers.L2(l2=1e-3), #keras.regularizers.L2(l2=hp.Float("dense_enc_l2", min_value=1e-3, max_value=1e-2, sampling="log"))
+            use_bias=False,
+        )
     )
 
-    # Mask useless values
-    model.add(
-        keras.layers.Masking(mask_value=0.0)
-    )
+    # Mask useless values to skip zero frames
+    keras.layers.Masking(mask_value=0.0)
 
     # LSTM layer for sequence learning
     model.add(
         keras.layers.LSTM(
-            units=128,  # Number of memory neurons
-            return_sequences=True,  # Sequences for continuous prediction
-            kernel_regularizer=keras.regularizers.L2(l2=0.01),
-            recurrent_regularizer=keras.regularizers.L2(l2=0.01),
+            units=128, # hp.Int("lstm_units", min_value=128, max_value=256, step=128),
+            return_sequences=True,
+            kernel_regularizer=keras.regularizers.L2(l2=1e-5), # keras.regularizers.L2(l2=hp.Float("lstm_l2", min_value=1e-7, max_value=1e-5, sampling="log")),
+            recurrent_regularizer=keras.regularizers.L2(l2=1e-5), # keras.regularizers.L2(l2=hp.Float("lstm_rec_l2", min_value=1e-7, max_value=1e-5, sampling="log")),
             use_bias=False,
         )
     )
@@ -72,25 +82,82 @@ def create_model(n_features: int, out_shape: int) -> keras.Sequential:
         keras.layers.Dense(
             units=out_shape,
             activation="linear",
-            kernel_regularizer=keras.regularizers.L2(l2=0.01),
+            kernel_regularizer=keras.regularizers.L2(l2=1e-2), # keras.regularizers.L2(hp.Float("dense_out_l2", 1e-4, 1e-2, sampling="log")),
             use_bias=False,
         )
     )
 
     # Leaky ReLU activation
-    model.add(keras.layers.LeakyReLU(negative_slope=0.02))
+    model.add(keras.layers.LeakyReLU(negative_slope=0.2))
 
-    # Cut the output so that we need only a limited portion of the resulting sequence
-    model.add(keras.layers.Lambda(lambda x: x[:, -N_FUTURES:, :]))
+    # Output slicing
+    model.add(keras.layers.Lambda(lambda x: x[:, -n_futures:, :]))
 
     # Compile the model
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=1e-3),
         loss=LOSS,
-        metrics=["mae"]
+        metrics=["mae"],
     )
 
     return model
+
+
+def tune_model(
+        n_features: int, 
+        out_shape: int, 
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_test: np.ndarray,
+        y_test: np.ndarray,
+        max_trials: int = 1, 
+        executions_per_trial: int = 1):
+    """
+    Tunes hyperparameters using Keras Tuner.
+    
+    Parameters:
+    -----------
+        n_features: int
+            Number of input features.
+        out_shape: int
+            Shape of the output layer.
+        max_trials: int
+            Maximum number of trials for tuning.
+        executions_per_trial: int
+            Number of executions per trial for reliability.
+        X_train: np.ndarray,
+            Train features.
+        y_train: np.ndarray,
+            Train targets.
+        X_test: np.ndarray,
+            Test features.
+        y_test: np.ndarray
+            Test targets.
+    
+    Returns:
+    --------
+        tuner: Hyperband
+            The tuner object with results.
+    """
+    tuner = kt.RandomSearch(
+        lambda hp: create_model(n_features, out_shape, N_FUTURES, hp=hp),
+        objective="val_mae",
+        max_trials=max_trials,
+        directory="hyperparameter_tuning",
+        project_name="time_series_model",
+    )
+
+    # Search for the best hyperparameters
+    tuner.search(
+        x=X_train,
+        y=y_train,
+        validation_data=(X_test, y_test),
+        epochs=N_EPOCHS,
+        batch_size=BATCH_SIZE,
+        callbacks=[keras.callbacks.EarlyStopping(monitor="val_loss", patience=5)],
+    )
+
+    return tuner
 
 
 def get_data_advance(date_string: str, n_days: int, n_years: int, n_future: int) -> list[str]:
@@ -336,37 +403,6 @@ def train_val_test_split(
 
     return train_data, val_data, test_data
 
-
-# K-Fold cross validation to check performance
-if False:
-    k = 5  # Number of folds
-    tscv = TimeSeriesSplit(n_splits=k)
-
-    # do K-Fold cross-validation
-    for idx, (train_index, val_index) in enumerate(tscv.split(train_data)):
-
-        print(f"Fold {idx + 1}/{k}")
-
-        # get train and test dates
-        dates_train = [train_data[i] for i in train_index]
-        dates_val = [train_data[i] for i in val_index]
-
-        # convert to features for train data
-        X_train , y_train = get_data_from_dates(dates=dates_train, df=df_data)
-
-        # convert to features for validation data
-        X_val, y_val = get_data_from_dates(dates=dates_val, df=df_data)
-
-        # create a model
-        model = create_model(n_features=N_FEATURES, out_shape=len(targets))
-
-        # fit model
-        history = model.fit(X_train, y_train, batch_size=BATCH_SIZE, epochs=N_EPOCHS, validation_data=(X_val, y_val), verbose=2)
-
-        # plot learning
-        plot_history(history=history)
-
-
 # for iterative learning
 def iterative_learning(
         old_data: pd.DataFrame, 
@@ -392,18 +428,32 @@ def iterative_learning(
         keras.Sequential
             The relearned model.
     """
+    # some preprocessing for correct memory selection
+    min_date = string_to_datetime(old_data.index.min())
+    min_date = (min_date + timedelta(days=N_FUTURES)).date()
+    min_date_str = datetime_to_string(min_date)
+    old_dates = [date for date in old_data.index if date >= min_date_str]
+
     # all dates for new learning
-    new_dates = list(new_data.index)
+    memory_size = int(len(old_dates) * 0.1)
+    memory_dates = list(np.random.choice(old_dates, size=memory_size, replace=False))
+    all_dates = list(new_data.index) + memory_dates
 
     # add new data to old data to use it later
     updated_df = pd.concat([old_data, new_data], ignore_index=False)
     
     # get data
-    X_data, y_data = get_data_from_dates(dates=new_dates, df=updated_df)
+    X_data, y_data = get_data_from_dates(dates=all_dates, df=updated_df)
 
     # create new model and fit it
     # model = create_model(n_features=updated_df.shape[1], out_shape=1)
-    model.fit(X_data, y_data, batch_size=BATCH_SIZE, epochs=N_EPOCHS, verbose=0)
+    model.fit(
+        X_data, 
+        y_data, 
+        batch_size=BATCH_SIZE, 
+        epochs=N_EPOCHS, 
+        verbose=0,
+    )
 
     return updated_df, model
 
@@ -624,4 +674,3 @@ def group_by_date(df: pd.DataFrame, time_unit: str = "M") -> pd.DataFrame:
     grouped_dates = df_dates.groupby('Group')[targets].sum()
 
     return grouped_dates
-

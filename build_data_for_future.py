@@ -1,11 +1,11 @@
-from mensa_ml import datetime_to_string, string_to_datetime
+from src.mensa_ml import datetime_to_string, string_to_datetime
 from datetime import timedelta
 import pandas as pd
 import numpy as np
 
 import requests
 from sklearn.preprocessing import OneHotEncoder
-from utils import is_christmas, is_covid, is_summer_semester, is_winter_semester, is_in_lecture_free
+from src.utils import is_christmas, is_covid, is_summer_semester, is_winter_semester, is_in_lecture_free
 from tqdm import tqdm
 from time import sleep
 
